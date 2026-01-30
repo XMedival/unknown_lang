@@ -1,0 +1,79 @@
+; mem.un - Memory management for un language
+; OS-agnostic arena allocator
+
+; Arena layout (first 16 bytes are metadata):
+;   [0-7]   = current allocation pointer
+;   [8-15]  = end pointer
+;   [16+]   = usable data
+
+fn arena_init(arena, size)
+    start = arena + 16
+    end_ptr = arena + size
+    asm
+        mov rdi, $arena
+        mov rax, $start
+        mov [rdi], rax
+        mov rax, $end_ptr
+        mov [rdi + 8], rax
+    end
+    ret 0
+end
+
+fn arena_alloc(arena, size)
+    ptr = 0
+    new_ptr = 0
+    end_ptr = 0
+    asm
+        mov rdi, $arena
+        mov rax, [rdi]
+        mov $ptr, rax
+        add rax, $size
+        mov $new_ptr, rax
+        mov rbx, [rdi + 8]
+        mov $end_ptr, rbx
+    end
+    ; check if we exceeded the arena
+    if new_ptr > end_ptr
+        ret 0
+    end
+    asm
+        mov rdi, $arena
+        mov rax, $new_ptr
+        mov [rdi], rax
+    end
+    ret ptr
+end
+
+fn arena_reset(arena)
+    start = arena + 16
+    asm
+        mov rdi, $arena
+        mov rax, $start
+        mov [rdi], rax
+    end
+    ret 0
+end
+
+fn arena_used(arena)
+    current = 0
+    start = arena + 16
+    asm
+        mov rdi, $arena
+        mov rax, [rdi]
+        mov $current, rax
+    end
+    ret current - start
+end
+
+fn arena_available(arena)
+    current = 0
+    end_ptr = 0
+    asm
+        mov rdi, $arena
+        mov rax, [rdi]
+        mov $current, rax
+        mov rax, [rdi + 8]
+        mov $end_ptr, rax
+    end
+    ret end_ptr - current
+end

@@ -18,35 +18,90 @@ import sys
 # end
 # """
 
-def expand_imports(source, included=None):
-    """Recursively expand import statements"""
+def preprocess_and_import(source, defines=None, included=None):
+    """Preprocess and expand imports together, so defines work across files"""
+    if defines is None:
+        defines = {}
     if included is None:
         included = set()
 
     result = []
+    cond_stack = []  # stack of (active, seen_true) tuples
+
     for line in source.split("\n"):
         stripped = line.strip()
-        if stripped.startswith("import "):
-            # extract filename: import "file.un" or import file.un
+
+        # Check if we're in an inactive conditional block
+        active = all(c[0] for c in cond_stack) if cond_stack else True
+
+        if stripped.startswith("#define "):
+            if active:
+                rest = stripped[8:].strip()
+                parts = rest.split(None, 1)
+                name = parts[0]
+                value = parts[1] if len(parts) > 1 else ""
+                defines[name] = value
+            continue
+
+        elif stripped.startswith("#undef "):
+            if active:
+                name = stripped[7:].strip()
+                defines.pop(name, None)
+            continue
+
+        elif stripped.startswith("#ifdef "):
+            name = stripped[7:].strip()
+            is_defined = name in defines
+            cond_stack.append((active and is_defined, is_defined))
+            continue
+
+        elif stripped.startswith("#ifndef "):
+            name = stripped[8:].strip()
+            is_defined = name in defines
+            cond_stack.append((active and not is_defined, not is_defined))
+            continue
+
+        elif stripped == "#else":
+            if cond_stack:
+                prev_active, seen_true = cond_stack.pop()
+                parent_active = all(c[0] for c in cond_stack) if cond_stack else True
+                cond_stack.append((parent_active and not seen_true, True))
+            continue
+
+        elif stripped == "#endif":
+            if cond_stack:
+                cond_stack.pop()
+            continue
+
+        # Handle imports - process with current defines
+        elif active and stripped.startswith("import "):
             rest = stripped[7:].strip()
             if rest.startswith('"') and rest.endswith('"'):
                 filename = rest[1:-1]
             else:
                 filename = rest
 
-            # avoid circular imports
             if filename not in included:
                 included.add(filename)
                 with open(filename) as f:
                     imported = f.read()
-                # recursively expand imports in the imported file
-                result.append(expand_imports(imported, included))
+                # Recursively process import with current defines
+                imported_result = preprocess_and_import(imported, defines, included)
+                result.append(imported_result)
             continue
-        result.append(line)
+
+        # Regular line - include if active, with macro substitution
+        if active:
+            for name, value in defines.items():
+                if value:
+                    line = line.replace(name, value)
+            result.append(line)
+
     return "\n".join(result)
 
+
 file = open(sys.argv[1])
-prog = expand_imports(file.read())
+prog = preprocess_and_import(file.read())
 
 # --- Scanner ---
 pos = 0
@@ -87,6 +142,59 @@ def read_number():
     while peek().isdigit():
         result += advance()
     return result
+
+
+def eval_const_expr(expr):
+    """Evaluate a constant expression like 1024*4 or 64+128"""
+    # Simple recursive descent parser for +, -, *, /, ()
+    expr = expr.replace(" ", "")
+    pos = [0]  # use list for nonlocal mutation
+
+    def peek_char():
+        return expr[pos[0]] if pos[0] < len(expr) else ""
+
+    def advance_char():
+        c = peek_char()
+        pos[0] += 1
+        return c
+
+    def parse_number():
+        result = ""
+        while peek_char().isdigit():
+            result += advance_char()
+        return int(result) if result else 0
+
+    def parse_factor():
+        if peek_char() == "(":
+            advance_char()  # skip (
+            result = parse_expr()
+            advance_char()  # skip )
+            return result
+        return parse_number()
+
+    def parse_term():
+        left = parse_factor()
+        while peek_char() and peek_char() in "*/":
+            op = advance_char()
+            right = parse_factor()
+            if op == "*":
+                left *= right
+            else:
+                left //= right
+        return left
+
+    def parse_expr():
+        left = parse_term()
+        while peek_char() and peek_char() in "+-":
+            op = advance_char()
+            right = parse_term()
+            if op == "+":
+                left += right
+            else:
+                left -= right
+        return left
+
+    return parse_expr()
 
 
 def read_string():
@@ -169,6 +277,16 @@ def next_token():
     if peek() == "]":
         advance()
         return ("rbracket", None)
+    if peek() == "&":
+        advance()
+        skip_ws()
+        var_name = read_word()
+        return ("addr", var_name)
+    if peek() == "@":
+        advance()
+        skip_ws()
+        var_name = read_word()
+        return ("deref", var_name)
     if peek() in "=<>!":
         c = advance()
         if peek() == "=":
@@ -184,8 +302,10 @@ def next_token():
 functions = {}  # name -> list of param names
 fn_vars = {}  # name -> {var: offset}
 fn_stack = {}  # name -> stack size
-string_vars = {}
+string_vars = {}  # var name -> label
+literal_strings = {}  # content -> label (for anonymous string literals)
 strings = []
+mem_buffers = []  # (name, size) tuples for .bss section
 blocks = []
 
 current_fn = None
@@ -211,6 +331,15 @@ def add_string(name, content):
     string_vars[name] = label
 
 
+def get_literal_string(content):
+    """Get or create a label for a string literal"""
+    if content not in literal_strings:
+        label = f"_str{len(strings)}"
+        strings.append((label, content))
+        literal_strings[content] = label
+    return literal_strings[content]
+
+
 def replace_var(match):
     name = match.group(1)
     if name in string_vars:
@@ -223,6 +352,38 @@ def load_val(tok, check_index=True):
     """Load value into rax. If check_index, peek for [index]"""
     if tok[0] == "num":
         return f"    mov rax, {tok[1]}"
+    elif tok[0] == "addr":
+        # &x - get address of variable
+        var_name = tok[1]
+        if var_name in string_vars:
+            return f"    mov rax, {string_vars[var_name]}"
+        else:
+            off = var_offset(var_name)
+            return f"    lea rax, [rbp - {off}]"
+    elif tok[0] == "deref":
+        # @x - dereference as qword, @x[i] - indexed qword access
+        var_name = tok[1]
+        asm = []
+        # load base pointer
+        if var_name in string_vars:
+            asm.append(f"    mov rdi, {string_vars[var_name]}")
+        else:
+            off = var_offset(var_name)
+            asm.append(f"    mov rdi, [rbp - {off}]")
+        # check for indexed access
+        if check_index and peek() == "[":
+            advance()  # skip [
+            idx_tok = next_token()
+            next_token()  # skip ]
+            if idx_tok[0] == "num":
+                asm.append(f"    mov rax, [rdi + {int(idx_tok[1]) * 8}]")
+            else:
+                idx_off = var_offset(idx_tok[1])
+                asm.append(f"    mov rax, [rbp - {idx_off}]")
+                asm.append(f"    mov rax, [rdi + rax*8]")
+        else:
+            asm.append(f"    mov rax, [rdi]")
+        return "\n".join(asm)
     elif tok[0] == "word":
         # check for array access: name[index]
         if check_index and peek() == "[":
@@ -257,6 +418,34 @@ def load_val_rbx(tok, check_index=True):
     """Load value into rbx. If check_index, peek for [index]"""
     if tok[0] == "num":
         return f"    mov rbx, {tok[1]}"
+    elif tok[0] == "addr":
+        var_name = tok[1]
+        if var_name in string_vars:
+            return f"    mov rbx, {string_vars[var_name]}"
+        else:
+            off = var_offset(var_name)
+            return f"    lea rbx, [rbp - {off}]"
+    elif tok[0] == "deref":
+        var_name = tok[1]
+        asm = []
+        if var_name in string_vars:
+            asm.append(f"    mov rsi, {string_vars[var_name]}")
+        else:
+            off = var_offset(var_name)
+            asm.append(f"    mov rsi, [rbp - {off}]")
+        if check_index and peek() == "[":
+            advance()
+            idx_tok = next_token()
+            next_token()
+            if idx_tok[0] == "num":
+                asm.append(f"    mov rbx, [rsi + {int(idx_tok[1]) * 8}]")
+            else:
+                idx_off = var_offset(idx_tok[1])
+                asm.append(f"    mov rbx, [rbp - {idx_off}]")
+                asm.append(f"    mov rbx, [rsi + rbx*8]")
+        else:
+            asm.append(f"    mov rbx, [rsi]")
+        return "\n".join(asm)
     elif tok[0] == "word":
         # check for array access
         if check_index and peek() == "[":
@@ -290,6 +479,37 @@ def load_val_rbx(tok, check_index=True):
 def load_arg(tok, reg):
     if tok[0] == "num":
         return f"    mov {reg}, {tok[1]}"
+    elif tok[0] == "addr":
+        var_name = tok[1]
+        if var_name in string_vars:
+            return f"    mov {reg}, {string_vars[var_name]}"
+        else:
+            off = var_offset(var_name)
+            return f"    lea {reg}, [rbp - {off}]"
+    elif tok[0] == "deref":
+        var_name = tok[1]
+        asm = []
+        if var_name in string_vars:
+            asm.append(f"    mov {reg}, {string_vars[var_name]}")
+        else:
+            off = var_offset(var_name)
+            asm.append(f"    mov {reg}, [rbp - {off}]")
+        # check for indexed access
+        if peek() == "[":
+            advance()
+            idx_tok = next_token()
+            next_token()  # skip ]
+            if idx_tok[0] == "num":
+                asm.append(f"    mov {reg}, [{reg} + {int(idx_tok[1]) * 8}]")
+            else:
+                idx_off = var_offset(idx_tok[1])
+                asm.append(f"    push rax")
+                asm.append(f"    mov rax, [rbp - {idx_off}]")
+                asm.append(f"    mov {reg}, [{reg} + rax*8]")
+                asm.append(f"    pop rax")
+        else:
+            asm.append(f"    mov {reg}, [{reg}]")
+        return "\n".join(asm)
     elif tok[1] in string_vars:
         return f"    mov {reg}, {string_vars[tok[1]]}"
     else:
@@ -302,6 +522,27 @@ def parse_call(fn_name):
     asm = []
     args = []
 
+    def collect_arg(tok):
+        """Process a token and return an arg tuple"""
+        if tok[0] == "str":
+            # string literal - get or create label
+            label = get_literal_string(tok[1])
+            return ("strlit", label)
+        elif tok[0] in ("deref", "addr"):
+            idx = None
+            if peek() == "[":
+                advance()
+                idx_tok = next_token()
+                next_token()  # skip ]
+                idx = idx_tok[1] if idx_tok else None
+            return (tok[0], tok[1], idx)
+        elif tok[0] == "word" and tok[1] in functions:
+            # nested function call - parse it recursively
+            inner_asm = parse_call(tok[1])
+            return ("call_result", inner_asm)
+        else:
+            return tok
+
     # check for parentheses syntax: fn(a, b)
     skip_ws()
     if peek() == "(":
@@ -312,8 +553,8 @@ def parse_call(fn_name):
                 advance()
                 break
             tok = next_token()
-            if tok and tok[0] in ("num", "word"):
-                args.append(tok)
+            if tok and tok[0] in ("num", "word", "addr", "deref", "str"):
+                args.append(collect_arg(tok))
             skip_ws()
             if peek() == ",":
                 advance()
@@ -323,14 +564,64 @@ def parse_call(fn_name):
             tok = next_token()
             if tok is None or tok[0] == "nl":
                 break
-            args.append(tok)
+            if tok[0] == "lbracket":
+                continue
+            if tok[0] in ("num", "word", "addr", "deref", "str"):
+                args.append(collect_arg(tok))
 
-    # load args into registers
+    # Handle nested calls first - emit their code and push results
+    nested_indices = []
     for i, arg in enumerate(args):
-        asm.append(load_arg(arg, arg_regs[i]))
+        if arg[0] == "call_result":
+            asm.append(arg[1])  # emit the nested call
+            asm.append("    push rax")  # save result
+            nested_indices.append(i)
+
+    # Pop nested results in reverse order and load into correct regs
+    # But first, load simple args
+    for i, arg in enumerate(args):
+        if arg[0] != "call_result":
+            asm.append(load_arg_ext(arg, arg_regs[i]))
+
+    # Now pop nested call results into their registers (reverse order)
+    for i in reversed(nested_indices):
+        asm.append(f"    pop {arg_regs[i]}")
 
     asm.append(f"    call {fn_name}")
     return "\n".join(asm)
+
+
+def load_arg_ext(tok, reg):
+    """Load arg into register, handling extended tuples for indexed deref/addr"""
+    if tok[0] == "strlit":
+        # string literal - tok[1] is the label
+        return f"    mov {reg}, {tok[1]}"
+    elif tok[0] == "call_result":
+        # handled separately via push/pop
+        return ""
+    elif len(tok) == 3 and tok[0] in ("deref", "addr"):
+        var_name = tok[1]
+        idx = tok[2]
+        if tok[0] == "deref":
+            asm = []
+            if var_name in string_vars:
+                asm.append(f"    mov {reg}, {string_vars[var_name]}")
+            else:
+                off = var_offset(var_name)
+                asm.append(f"    mov {reg}, [rbp - {off}]")
+            if idx is not None:
+                asm.append(f"    mov {reg}, [{reg} + {int(idx) * 8}]")
+            else:
+                asm.append(f"    mov {reg}, [{reg}]")
+            return "\n".join(asm)
+        else:  # addr
+            if var_name in string_vars:
+                return f"    mov {reg}, {string_vars[var_name]}"
+            else:
+                off = var_offset(var_name)
+                return f"    lea {reg}, [rbp - {off}]"
+    else:
+        return load_arg(tok, reg)
 
 
 def parse_expr(first_tok):
@@ -376,6 +667,26 @@ while pos < len(prog):
             blocks.pop()
         continue
 
+    # handle mem block contents
+    if blocks and blocks[-1] == "mem":
+        skip_ws()
+        if peek() == "\n":
+            advance()
+            continue
+        name = read_word()
+        if name == "end":
+            blocks.pop()
+            skip_line()
+            continue
+        skip_ws()
+        # read size expression until newline
+        size_expr = read_until("\n").strip()
+        if name and size_expr:
+            size = eval_const_expr(size_expr)
+            mem_buffers.append((name, size))
+        skip_line()
+        continue
+
     tok = next_token()
     if tok is None:
         break
@@ -403,6 +714,23 @@ while pos < len(prog):
         continue
 
     if tok == ("word", "else"):
+        skip_line()
+        continue
+
+    if tok == ("word", "mem"):
+        skip_ws()
+        if peek() == "\n":
+            # block style: mem\n  name size\n  ...\nend
+            blocks.append("mem")
+            skip_line()
+            continue
+        # single line: mem name size_expr
+        name = read_word()
+        skip_ws()
+        size_expr = read_until("\n").strip()
+        if name and size_expr:
+            size = eval_const_expr(size_expr)
+            mem_buffers.append((name, size))
         skip_line()
         continue
 
@@ -452,35 +780,18 @@ while pos < len(prog):
                 var_offset(name)
         skip_line()
 
+# Register mem buffer names so they can be used like string labels
+for name, size in mem_buffers:
+    string_vars[name] = name
+
 # --- Second pass: generate code ---
 pos = 0
 out = []
 blocks = []
 current_fn = None
 
-if strings:
-    out.append("section .data")
-    for label, content in strings:
-        parts = []
-        current = ""
-        for c in content:
-            if c == "\n":
-                if current:
-                    parts.append(f'"{current}"')
-                parts.append("10")
-                current = ""
-            elif c == "\t":
-                if current:
-                    parts.append(f'"{current}"')
-                parts.append("9")
-                current = ""
-            else:
-                current += c
-        if current:
-            parts.append(f'"{current}"')
-        parts.append("0")
-        out.append(f"    {label}: db {', '.join(parts)}")
-    out.append("")
+# Note: .data section will be prepended after code generation
+# so that string literals from parse_call are included
 
 out.append("section .text")
 out.append("")
@@ -797,7 +1108,42 @@ while pos < len(prog):
         case _:
             skip_line()
 
-asm_out = "\n".join(out)
+# Generate .data section (after code generation so literals are included)
+data_section = []
+if strings:
+    data_section.append("section .data")
+    for label, content in strings:
+        parts = []
+        current = ""
+        for c in content:
+            if c == "\n":
+                if current:
+                    parts.append(f'"{current}"')
+                parts.append("10")
+                current = ""
+            elif c == "\t":
+                if current:
+                    parts.append(f'"{current}"')
+                parts.append("9")
+                current = ""
+            else:
+                current += c
+        if current:
+            parts.append(f'"{current}"')
+        parts.append("0")
+        data_section.append(f"    {label}: db {', '.join(parts)}")
+    data_section.append("")
+
+# Generate .bss section for mem buffers
+bss_section = []
+if mem_buffers:
+    bss_section.append("section .bss")
+    for name, size in mem_buffers:
+        bss_section.append(f"    {name}: resb {size}")
+    bss_section.append("")
+
+# Combine: .data first, then .bss, then .text
+asm_out = "\n".join(data_section + bss_section + out)
 with open("out.asm", "w") as f:
     f.write(asm_out)
 # print(asm_out)

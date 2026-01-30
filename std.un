@@ -18,6 +18,18 @@ fn print(s)
     ret 0
 end
 
+fn eprint(s)
+    l = strlen s
+    asm
+        mov rax, 1
+        mov rdi, 2
+        mov rsi, $s
+        mov rdx, $l
+        syscall
+    end
+    ret 0
+end
+
 fn exit(c)
     asm
         mov rax, 60
@@ -25,3 +37,17 @@ fn exit(c)
         syscall
     end
 end
+
+#ifndef NO_START
+fn _start()
+    argc = 0
+    argv = 0
+    asm
+        mov rax, [rbp + 8]
+        mov $argc, rax
+        lea rax, [rbp + 16]
+        mov $argv, rax
+    end
+    exit main(argc, argv)
+end
+#endif
