@@ -1,0 +1,7 @@
+import "std.un"
+
+fn _start()
+    msg = "Hello World\n"
+    print msg
+    exit 0
+end

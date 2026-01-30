@@ -1,0 +1,27 @@
+fn strlen(s)
+    result = 0
+    for i = 0; s[i] != 0; i=i+1
+        result = result + 1
+    end
+    ret result
+end
+
+fn print(s)
+    l = strlen s
+    asm
+        mov rax, 1
+        mov rdi, 1
+        mov rsi, $s
+        mov rdx, $l
+        syscall
+    end
+    ret 0
+end
+
+fn exit(c)
+    asm
+        mov rax, 60
+        mov rdi, $c
+        syscall
+    end
+end
